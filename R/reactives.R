@@ -6,26 +6,43 @@ Dependents <- R6Class(
   portable = FALSE,
   class = FALSE,
   public = list(
+    .reactId = character(0),
     .dependents = 'Map',
 
-    initialize = function() {
+    initialize = function(reactId = NULL) {
+      .reactId <<- reactId
       .dependents <<- Map$new()
     },
-    register = function(depId=NULL, depLabel=NULL) {
-      ctx <- .getReactiveEnvironment()$currentContext()
+    # ... ignored, use to be depLabel and depId, not used anymore
+    register = function(...) {
+      ctx <- getCurrentContext()
       if (!.dependents$containsKey(ctx$id)) {
+
+        # must wrap in if statement as ctx react id could be NULL
+        #   if options(shiny.suppressMissingContextError = TRUE)
+        if (is.character(.reactId) && is.character(ctx$.reactId)) {
+          rLog$dependsOn(ctx$.reactId, .reactId, ctx$id, ctx$.domain)
+        }
+
         .dependents$set(ctx$id, ctx)
+
         ctx$onInvalidate(function() {
+          rLog$dependsOnRemove(ctx$.reactId, .reactId, ctx$id, ctx$.domain)
           .dependents$remove(ctx$id)
         })
-
-        if (!is.null(depId) && nchar(depId) > 0)
-          .graphDependsOnId(ctx$id, depId)
-        if (!is.null(depLabel))
-          .graphDependsOn(ctx$id, depLabel)
       }
     },
-    invalidate = function() {
+    # at times, the context is run in a ctx$onInvalidate(...) which has no runtime context
+    invalidate = function(log = TRUE) {
+      if (isTRUE(log)) {
+
+        domain <- getDefaultReactiveDomain()
+        rLog$invalidateStart(.reactId, NULL, "other", domain)
+        on.exit(
+          rLog$invalidateEnd(.reactId, NULL, "other", domain),
+          add = TRUE
+        )
+      }
       lapply(
         .dependents$values(),
         function(ctx) {
@@ -44,6 +61,7 @@ ReactiveVal <- R6Class(
   'ReactiveVal',
   portable = FALSE,
   private = list(
+    reactId = character(0),
     value = NULL,
     label = NULL,
     frozen = FALSE,
@@ -51,13 +69,15 @@ ReactiveVal <- R6Class(
   ),
   public = list(
     initialize = function(value, label = NULL) {
+      reactId <- nextGlobalReactId()
+      private$reactId <- reactId
       private$value <- value
       private$label <- label
-      private$dependents <- Dependents$new()
-      .graphValueChange(private$label, value)
+      private$dependents <- Dependents$new(reactId = private$reactId)
+      rLog$define(private$reactId, value, private$label, type = "reactiveVal", getDefaultReactiveDomain())
     },
     get = function() {
-      private$dependents$register(depLabel = private$label)
+      private$dependents$register()
 
       if (private$frozen)
         reactiveStop()
@@ -68,8 +88,8 @@ ReactiveVal <- R6Class(
       if (identical(private$value, value)) {
         return(invisible(FALSE))
       }
+      rLog$valueChange(private$reactId, value, getDefaultReactiveDomain())
       private$value <- value
-      .graphValueChange(private$label, value)
       private$dependents$invalidate()
       invisible(TRUE)
     },
@@ -77,12 +97,14 @@ ReactiveVal <- R6Class(
       if (is.null(session)) {
         stop("Can't freeze a reactiveVal without a reactive domain")
       }
+      rLog$freezeReactiveVal(private$reactId, session)
       session$onFlushed(function() {
-        self$thaw()
+        self$thaw(session)
       })
       private$frozen <- TRUE
     },
-    thaw = function() {
+    thaw = function(session = getDefaultReactiveDomain()) {
+      rLog$thawReactiveVal(private$reactId, session)
       private$frozen <- FALSE
     },
     isFrozen = function() {
@@ -91,7 +113,7 @@ ReactiveVal <- R6Class(
     format = function(...) {
       # capture.output(print()) is necessary because format() doesn't
       # necessarily return a character vector, e.g. data.frame.
-      label <- capture.output(print(base::format(private$value, ...)))
+      label <- utils::capture.output(print(base::format(private$value, ...)))
       if (length(label) == 1) {
         paste0("reactiveVal: ", label)
       } else {
@@ -118,7 +140,7 @@ ReactiveVal <- R6Class(
 #'
 #' @param value An optional initial value.
 #' @param label An optional label, for debugging purposes (see
-#'   \code{\link{showReactLog}}). If missing, a label will be automatically
+#'   \code{\link{reactlog}}). If missing, a label will be automatically
 #'   created.
 #'
 #' @return A function. Call the function with no arguments to (reactively) read
@@ -268,6 +290,7 @@ ReactiveValues <- R6Class(
   portable = FALSE,
   public = list(
     # For debug purposes
+    .reactId = character(0),
     .label = character(0),
     .values = 'environment',
     .metadata = 'environment',
@@ -278,28 +301,49 @@ ReactiveValues <- R6Class(
     .allValuesDeps = 'Dependents',
     # Dependents for all values
     .valuesDeps = 'Dependents',
+    .dedupe = logical(0),
+    # Key, asList(), or names() have been retrieved
+    .hasRetrieved = list(),
 
-    initialize = function() {
-      .label <<- paste('reactiveValues',
-                       p_randomInt(1000, 10000),
-                       sep="")
+
+    initialize = function(
+      dedupe = TRUE,
+      label = paste0('reactiveValues', p_randomInt(1000, 10000))
+    ) {
+      .reactId <<- nextGlobalReactId()
+      .label <<- label
       .values <<- new.env(parent=emptyenv())
       .metadata <<- new.env(parent=emptyenv())
       .dependents <<- new.env(parent=emptyenv())
-      .namesDeps <<- Dependents$new()
-      .allValuesDeps <<- Dependents$new()
-      .valuesDeps <<- Dependents$new()
+      .hasRetrieved <<- list(names = FALSE, asListAll = FALSE, asList = FALSE, keys = list())
+      .namesDeps <<- Dependents$new(reactId = rLog$namesIdStr(.reactId))
+      .allValuesDeps <<- Dependents$new(reactId = rLog$asListAllIdStr(.reactId))
+      .valuesDeps <<- Dependents$new(reactId = rLog$asListIdStr(.reactId))
+      .dedupe <<- dedupe
     },
 
     get = function(key) {
+      # get value right away to use for logging
+      if (!exists(key, envir=.values, inherits=FALSE))
+        keyValue <- NULL
+      else
+        keyValue <- .values[[key]]
+
       # Register the "downstream" reactive which is accessing this value, so
       # that we know to invalidate them when this value changes.
-      ctx <- .getReactiveEnvironment()$currentContext()
+      ctx <- getCurrentContext()
       dep.key <- paste(key, ':', ctx$id, sep='')
       if (!exists(dep.key, envir=.dependents, inherits=FALSE)) {
-        .graphDependsOn(ctx$id, sprintf('%s$%s', .label, key))
+        reactKeyId <- rLog$keyIdStr(.reactId, key)
+
+        if (!isTRUE(.hasRetrieved$keys[[key]])) {
+          rLog$defineKey(.reactId, keyValue, key, .label, ctx$.domain)
+          .hasRetrieved$keys[[key]] <<- TRUE
+        }
+        rLog$dependsOnKey(ctx$.reactId, .reactId, key, ctx$id, ctx$.domain)
         .dependents[[dep.key]] <- ctx
         ctx$onInvalidate(function() {
+          rLog$dependsOnKeyRemove(ctx$.reactId, .reactId, key, ctx$id, ctx$.domain)
           rm(list=dep.key, envir=.dependents, inherits=FALSE)
         })
       }
@@ -307,34 +351,82 @@ ReactiveValues <- R6Class(
       if (isFrozen(key))
         reactiveStop()
 
-      if (!exists(key, envir=.values, inherits=FALSE))
-        NULL
-      else
-        .values[[key]]
+      keyValue
     },
 
     set = function(key, value) {
+      # if key exists
+      #   if it is the same value, return
+      #
+      # update value of `key`
+      #
+      # if key exists
+      #   if `key` has been read,
+      #     log `update key`
+      #     ## (invalidate key later in code)
+      # else # if new key
+      #   if `names()` have been read,
+      #     log `update names()`
+      #     invalidate `names()`
+      #
+      # if hidden
+      #   if asListAll has been read,
+      #     log `update asList(all.names = TRUE)`
+      #     invalidate `asListAll`
+      # else # not hidden
+      #   if asList has been read,
+      #     log `update asList()`
+      #     invalidate `asList`
+      #
+      # update value of `key`
+      # invalidate all deps of `key`
+
+      domain <- getDefaultReactiveDomain()
       hidden <- substr(key, 1, 1) == "."
 
-      if (exists(key, envir=.values, inherits=FALSE)) {
-        if (identical(.values[[key]], value)) {
+      key_exists <- exists(key, envir=.values, inherits=FALSE)
+
+      if (key_exists) {
+        if (.dedupe && identical(.values[[key]], value)) {
           return(invisible())
         }
       }
-      else {
-        .namesDeps$invalidate()
-      }
 
-      if (hidden)
-        .allValuesDeps$invalidate()
-      else
-        .valuesDeps$invalidate()
-
+      # set the value for better logging
       .values[[key]] <- value
 
-      .graphValueChange(sprintf('names(%s)', .label), ls(.values, all.names=TRUE))
-      .graphValueChange(sprintf('%s (all)', .label), as.list(.values))
-      .graphValueChange(sprintf('%s$%s', .label, key), value)
+      if (key_exists) {
+        # key has been depended upon (can not happen if the key is being set)
+        if (isTRUE(.hasRetrieved$keys[[key]])) {
+          rLog$valueChangeKey(.reactId, key, value, domain)
+          keyReactId <- rLog$keyIdStr(.reactId, key)
+          rLog$invalidateStart(keyReactId, NULL, "other", domain)
+          on.exit(
+            rLog$invalidateEnd(keyReactId, NULL, "other", domain),
+            add = TRUE
+          )
+        }
+
+      } else {
+        # only invalidate if there are deps
+        if (isTRUE(.hasRetrieved$names)) {
+          rLog$valueChangeNames(.reactId, ls(.values, all.names = TRUE), domain)
+          .namesDeps$invalidate()
+        }
+      }
+
+      if (hidden) {
+        if (isTRUE(.hasRetrieved$asListAll)) {
+          rLog$valueChangeAsListAll(.reactId, as.list(.values, all.names = TRUE), domain)
+          .allValuesDeps$invalidate()
+        }
+      } else {
+        if (isTRUE(.hasRetrieved$asList)) {
+          # leave as is. both object would be registered to the listening object
+          rLog$valueChangeAsList(.reactId, as.list(.values, all.names = FALSE), domain)
+          .valuesDeps$invalidate()
+        }
+      }
 
       dep.keys <- objects(
         envir=.dependents,
@@ -359,10 +451,14 @@ ReactiveValues <- R6Class(
     },
 
     names = function() {
-      .graphDependsOn(.getReactiveEnvironment()$currentContext()$id,
-                      sprintf('names(%s)', .label))
+      nameValues <- ls(.values, all.names=TRUE)
+      if (!isTRUE(.hasRetrieved$names)) {
+        domain <- getDefaultReactiveDomain()
+        rLog$defineNames(.reactId, nameValues, .label, domain)
+        .hasRetrieved$names <<- TRUE
+      }
       .namesDeps$register()
-      return(ls(.values, all.names=TRUE))
+      return(nameValues)
     },
 
     # Get a metadata value. Does not trigger reactivity.
@@ -387,10 +483,14 @@ ReactiveValues <- R6Class(
     # Mark a value as frozen If accessed while frozen, a shiny.silent.error will
     # be thrown.
     freeze = function(key) {
+      domain <- getDefaultReactiveDomain()
+      rLog$freezeReactiveKey(.reactId, key, domain)
       setMeta(key, "frozen", TRUE)
     },
 
     thaw = function(key) {
+      domain <- getDefaultReactiveDomain()
+      rLog$thawReactiveKey(.reactId, key, domain)
       setMeta(key, "frozen", NULL)
     },
 
@@ -399,19 +499,27 @@ ReactiveValues <- R6Class(
     },
 
     toList = function(all.names=FALSE) {
-      .graphDependsOn(.getReactiveEnvironment()$currentContext()$id,
-                      sprintf('%s (all)', .label))
-      if (all.names)
+      listValue <- as.list(.values, all.names=all.names)
+      if (all.names) {
+        if (!isTRUE(.hasRetrieved$asListAll)) {
+          domain <- getDefaultReactiveDomain()
+          rLog$defineAsListAll(.reactId, listValue, .label, domain)
+          .hasRetrieved$asListAll <<- TRUE
+        }
         .allValuesDeps$register()
+      }
 
+      if (!isTRUE(.hasRetrieved$asList)) {
+        domain <- getDefaultReactiveDomain()
+        # making sure the value being recorded is with `all.names = FALSE`
+        rLog$defineAsList(.reactId, as.list(.values, all.names=FALSE), .label, domain)
+        .hasRetrieved$asList <<- TRUE
+      }
       .valuesDeps$register()
 
-      return(as.list(.values, all.names=all.names))
-    },
-
-    .setLabel = function(label) {
-      .label <<- label
+      return(listValue)
     }
+
   )
 )
 
@@ -560,11 +668,6 @@ as.list.reactivevalues <- function(x, all.names=FALSE, ...) {
   reactiveValuesToList(x, all.names)
 }
 
-# For debug purposes
-.setLabel <- function(x, label) {
-  .subset2(x, 'impl')$.setLabel(label)
-}
-
 #' Convert a reactivevalues object to a list
 #'
 #' This function does something similar to what you might \code{\link[base]{as.list}}
@@ -687,6 +790,7 @@ Observable <- R6Class(
   'Observable',
   portable = FALSE,
   public = list(
+    .reactId = character(0),
     .origFunc = 'function',
     .func = 'function',
     .label = character(0),
@@ -717,16 +821,18 @@ Observable <- R6Class(
         funcLabel <- paste0("<reactive:", label, ">")
       }
 
+      .reactId <<- nextGlobalReactId()
       .origFunc <<- func
       .func <<- wrapFunctionLabel(func, funcLabel,
         ..stacktraceon = ..stacktraceon)
       .label <<- label
       .domain <<- domain
-      .dependents <<- Dependents$new()
+      .dependents <<- Dependents$new(reactId = .reactId)
       .invalidated <<- TRUE
       .running <<- FALSE
       .execCount <<- 0L
       .mostRecentCtxId <<- ""
+      rLog$define(.reactId, .value, .label, type = "observable", .domain)
     },
     getValue = function() {
       .dependents$register()
@@ -736,8 +842,6 @@ Observable <- R6Class(
           self$.updateValue()
         )
       }
-
-      .graphDependsOnId(getCurrentContext()$id, .mostRecentCtxId)
 
       if (.error) {
         stop(.value)
@@ -754,12 +858,12 @@ Observable <- R6Class(
     },
     .updateValue = function() {
       ctx <- Context$new(.domain, .label, type = 'observable',
-                         prevId = .mostRecentCtxId)
+                         prevId = .mostRecentCtxId, reactId = .reactId)
       .mostRecentCtxId <<- ctx$id
       ctx$onInvalidate(function() {
         .invalidated <<- TRUE
         .value <<- NULL # Value can be GC'd, it won't be read once invalidated
-        .dependents$invalidate()
+        .dependents$invalidate(log = FALSE)
       })
       .execCount <<- .execCount + 1L
 
@@ -781,18 +885,6 @@ Observable <- R6Class(
             # If an error occurs, we want to propagate the error, but we also
             # want to save a copy of it, so future callers of this reactive will
             # get the same error (i.e. the error is cached).
-
-            # We stripStackTrace in the next line, just in case someone
-            # downstream of us (i.e. deeper into the call stack) used
-            # captureStackTraces; otherwise the entire stack would always be the
-            # same (i.e. you'd always see the whole stack trace of the *first*
-            # time the code was run and the condition raised; there'd be no way
-            # to see the stack trace of the call site that caused the cached
-            # exception to be re-raised, and you need that information to figure
-            # out what's triggering the re-raise).
-            #
-            # We use try(stop()) as an easy way to generate a try-error object
-            # out of this condition.
             .value <<- cond
             .error <<- TRUE
             .visible <<- FALSE
@@ -945,6 +1037,7 @@ Observer <- R6Class(
   'Observer',
   portable = FALSE,
   public = list(
+    .reactId = character(0),
     .func = 'function',
     .label = character(0),
     .domain = 'ANY',
@@ -969,19 +1062,12 @@ Observer <- R6Class(
       if (length(formals(observerFunc)) > 0)
         stop("Can't make an observer from a function that takes parameters; ",
              "only functions without parameters can be reactive.")
-registerDebugHook("observerFunc", environment(), label)
-      .func <<- function() {
-        tryCatch(
-          if (..stacktraceon)
-            ..stacktraceon..(observerFunc())
-          else
-            observerFunc(),
-          # It's OK for shiny.silent.error errors to cause an observer to stop running
-          shiny.silent.error = function(e) NULL
-          # validation = function(e) NULL,
-          # shiny.output.cancel = function(e) NULL
-        )
+      if (grepl("\\s", label, perl = TRUE)) {
+        funcLabel <- "<observer>"
+      } else {
+        funcLabel <- paste0("<observer:", label, ">")
       }
+      .func <<- wrapFunctionLabel(observerFunc, funcLabel, ..stacktraceon = ..stacktraceon)
       .label <<- label
       .domain <<- domain
       .priority <<- normalizePriority(priority)
@@ -995,11 +1081,14 @@ registerDebugHook("observerFunc", environment(), label)
       .autoDestroyHandle <<- NULL
       setAutoDestroy(autoDestroy)
 
+      .reactId <<- nextGlobalReactId()
+      rLog$defineObserver(.reactId, .label, .domain)
+
       # Defer the first running of this until flushReact is called
       .createContext()$invalidate()
     },
     .createContext = function() {
-      ctx <- Context$new(.domain, .label, type='observer', prevId=.prevId)
+      ctx <- Context$new(.domain, .label, type='observer', prevId=.prevId, reactId = .reactId)
       .prevId <<- ctx$id
 
       if (!is.null(.ctx)) {
@@ -1026,6 +1115,9 @@ registerDebugHook("observerFunc", environment(), label)
 
         continue <- function() {
           ctx$addPendingFlush(.priority)
+          if (!is.null(.domain)) {
+            .domain$incrementBusyCount()
+          }
         }
 
         if (.suspended == FALSE)
@@ -1035,16 +1127,30 @@ registerDebugHook("observerFunc", environment(), label)
       })
 
       ctx$onFlush(function() {
-        tryCatch({
-          if (!.destroyed)
-            shinyCallingHandlers(run())
 
-        }, error = function(e) {
-          printError(e)
-          if (!is.null(.domain)) {
-            .domain$unhandledError(e)
-          }
-        })
+        hybrid_chain(
+          {
+            if (!.destroyed) {
+              shinyCallingHandlers(run())
+            }
+          },
+          catch = function(e) {
+            # It's OK for shiny.silent.error errors to cause an observer to stop running
+            # shiny.silent.error = function(e) NULL
+            # validation = function(e) NULL,
+            # shiny.output.cancel = function(e) NULL
+
+            if (inherits(e, "shiny.silent.error")) {
+              return()
+            }
+
+            printError(e)
+            if (!is.null(.domain)) {
+              .domain$unhandledError(e)
+            }
+          },
+          finally = .domain$decrementBusyCount
+        )
       })
 
       return(ctx)
@@ -1393,30 +1499,52 @@ reactiveTimer <- function(intervalMs=1000, session = getDefaultReactiveDomain())
   # callback below is fired (see #1621).
   force(session)
 
+  # TODO-barret - ## leave alone for now
+  # reactId <- nextGlobalReactId()
+  # rLog$define(reactId, paste0("timer(", intervalMs, ")"))
+
   dependents <- Map$new()
-  timerCallbacks$schedule(intervalMs, function() {
+  timerHandle <- scheduleTask(intervalMs, function() {
     # Quit if the session is closed
     if (!is.null(session) && session$isClosed()) {
       return(invisible())
     }
 
-    timerCallbacks$schedule(intervalMs, sys.function())
-    lapply(
-      dependents$values(),
-      function(dep.ctx) {
-        dep.ctx$invalidate()
-        NULL
-      })
+    timerHandle <<- scheduleTask(intervalMs, sys.function())
+
+    doInvalidate <- function() {
+      lapply(
+        dependents$values(),
+        function(dep.ctx) {
+          dep.ctx$invalidate()
+          NULL
+        })
+    }
+
+    if (!is.null(session)) {
+      # If this timer belongs to a session, we must wait until the next cycle is
+      # ready to invalidate.
+      session$cycleStartAction(doInvalidate)
+    } else {
+      # If this timer doesn't belong to a session, we invalidate right away.
+      doInvalidate()
+    }
   })
+
+  if (!is.null(session)) {
+    session$onEnded(timerHandle)
+  }
+
   return(function() {
-    ctx <- .getReactiveEnvironment()$currentContext()
+    newValue <- Sys.time()
+    ctx <- getCurrentContext()
     if (!dependents$containsKey(ctx$id)) {
       dependents$set(ctx$id, ctx)
       ctx$onInvalidate(function() {
         dependents$remove(ctx$id)
       })
     }
-    return(Sys.time())
+    return(newValue)
   })
 }
 
@@ -1475,14 +1603,31 @@ reactiveTimer <- function(intervalMs=1000, session = getDefaultReactiveDomain())
 #' }
 #' @export
 invalidateLater <- function(millis, session = getDefaultReactiveDomain()) {
-  ctx <- .getReactiveEnvironment()$currentContext()
-  timerCallbacks$schedule(millis, function() {
-    # Quit if the session is closed
-    if (!is.null(session) && session$isClosed()) {
+
+  force(session)
+
+  ctx <- getCurrentContext()
+  rLog$invalidateLater(ctx$.reactId, ctx$id, millis, session)
+
+  timerHandle <- scheduleTask(millis, function() {
+    if (is.null(session)) {
+      ctx$invalidate()
       return(invisible())
     }
-    ctx$invalidate()
+
+    if (!session$isClosed()) {
+      session$cycleStartAction(function() {
+        ctx$invalidate()
+      })
+    }
+
+    invisible()
   })
+
+  if (!is.null(session)) {
+    session$onEnded(timerHandle)
+  }
+
   invisible()
 }
 
@@ -1728,7 +1873,12 @@ reactiveFileReader <- function(intervalMillis, session, filePath, readFunc, ...)
 #' # input object, like input$x
 #' @export
 isolate <- function(expr) {
-  ctx <- Context$new(getDefaultReactiveDomain(), '[isolate]', type='isolate')
+  if (hasCurrentContext()) {
+    reactId <- getCurrentContext()$.reactId
+  } else {
+    reactId <- rLog$noReactId
+  }
+  ctx <- Context$new(getDefaultReactiveDomain(), '[isolate]', type='isolate', reactId = reactId)
   on.exit(ctx$invalidate())
   # Matching ..stacktraceon../..stacktraceoff.. pair
   ..stacktraceoff..(ctx$run(function() {
@@ -1800,15 +1950,20 @@ maskReactiveContext <- function(expr) {
 #' the action/calculation and just let the user re-initiate it (like a
 #' "Recalculate" button).
 #'
-#' Unlike what happens for \code{ignoreNULL}, only \code{observeEvent} takes in an
-#' \code{ignoreInit} argument. By default, \code{observeEvent} will run right when
-#' it is created (except if, at that moment, \code{eventExpr} evaluates to \code{NULL}
+#' Likewise, both \code{observeEvent} and \code{eventReactive} also take in an
+#' \code{ignoreInit} argument. By default, both of these will run right when they
+#' are created (except if, at that moment, \code{eventExpr} evaluates to \code{NULL}
 #' and \code{ignoreNULL} is \code{TRUE}). But when responding to a click of an action
 #' button, it may often be useful to set \code{ignoreInit} to \code{TRUE}. For
 #' example, if you're setting up an \code{observeEvent} for a dynamically created
 #' button, then \code{ignoreInit = TRUE} will guarantee that the action (in
 #' \code{handlerExpr}) will only be triggered when the button is actually clicked,
-#' instead of also being triggered when it is created/initialized.
+#' instead of also being triggered when it is created/initialized. Similarly,
+#' if you're setting up an \code{eventReactive} that responds to a dynamically
+#' created button used to refresh some data (then returned by that \code{eventReactive}),
+#' then you should use \code{eventReactive([...], ignoreInit = TRUE)} if you want
+#' to let the user decide if/when they want to refresh the data (since, depending
+#' on the app, this may be a computationally expensive operation).
 #'
 #' Even though \code{ignoreNULL} and \code{ignoreInit} can be used for similar
 #' purposes they are independent from one another. Here's the result of combining
@@ -1816,25 +1971,28 @@ maskReactiveContext <- function(expr) {
 #'
 #' \describe{
 #'   \item{\code{ignoreNULL = TRUE} and \code{ignoreInit = FALSE}}{
-#'      This is the default. This combination means that \code{handlerExpr} will
-#'      run every time that \code{eventExpr} is not \code{NULL}. If, at the time
-#'      of the \code{observeEvent}'s creation, \code{handleExpr} happens to
-#'      \emph{not} be \code{NULL}, then the code runs.
+#'      This is the default. This combination means that \code{handlerExpr}/
+#'      \code{valueExpr} will run every time that \code{eventExpr} is not
+#'      \code{NULL}. If, at the time of the creation of the
+#'      \code{observeEvent}/\code{eventReactive}, \code{eventExpr} happens
+#'      to \emph{not} be \code{NULL}, then the code runs.
 #'   }
 #'   \item{\code{ignoreNULL = FALSE} and \code{ignoreInit = FALSE}}{
-#'      This combination means that \code{handlerExpr} will run every time no
-#'      matter what.
+#'      This combination means that \code{handlerExpr}/\code{valueExpr} will
+#'      run every time no matter what.
 #'   }
 #'   \item{\code{ignoreNULL = FALSE} and \code{ignoreInit = TRUE}}{
-#'      This combination means that \code{handlerExpr} will \emph{not} run when
-#'      the \code{observeEvent} is created (because \code{ignoreInit = TRUE}),
-#'      but it will run every other time.
+#'      This combination means that \code{handlerExpr}/\code{valueExpr} will
+#'      \emph{not} run when the \code{observeEvent}/\code{eventReactive} is
+#'      created (because \code{ignoreInit = TRUE}), but it will run every
+#'      other time.
 #'   }
 #'   \item{\code{ignoreNULL = TRUE} and \code{ignoreInit = TRUE}}{
-#'      This combination means that \code{handlerExpr} will \emph{not} run when
-#'      the \code{observeEvent} is created (because \code{ignoreInit = TRUE}).
-#'      After that, \code{handlerExpr} will run every time that \code{eventExpr}
-#'      is not \code{NULL}.
+#'      This combination means that \code{handlerExpr}/\code{valueExpr} will
+#'      \emph{not} run when the \code{observeEvent}/\code{eventReactive} is
+#'      created (because  \code{ignoreInit = TRUE}). After that,
+#'      \code{handlerExpr}/\code{valueExpr} will run every time that
+#'      \code{eventExpr} is not \code{NULL}.
 #'   }
 #' }
 #'
@@ -1974,22 +2132,25 @@ observeEvent <- function(eventExpr, handlerExpr,
   initialized <- FALSE
 
   o <- observe({
-    e <- eventFunc()
+    hybrid_chain(
+      {eventFunc()},
+      function(value) {
+        if (ignoreInit && !initialized) {
+          initialized <<- TRUE
+          return()
+        }
 
-    if (ignoreInit && !initialized) {
-      initialized <<- TRUE
-      return()
-    }
+        if (ignoreNULL && isNullEvent(value)) {
+          return()
+        }
 
-    if (ignoreNULL && isNullEvent(e)) {
-      return()
-    }
+        if (once) {
+          on.exit(o$destroy())
+        }
 
-    if (once) {
-      on.exit(o$destroy())
-    }
-
-    isolate(handlerFunc())
+        isolate(handlerFunc())
+      }
+    )
   }, label = label, suspended = suspended, priority = priority, domain = domain,
   autoDestroy = TRUE, ..stacktraceon = FALSE)
 
@@ -2015,16 +2176,19 @@ eventReactive <- function(eventExpr, valueExpr,
   initialized <- FALSE
 
   invisible(reactive({
-    e <- eventFunc()
+    hybrid_chain(
+      eventFunc(),
+      function(value) {
+        if (ignoreInit && !initialized) {
+          initialized <<- TRUE
+          req(FALSE)
+        }
 
-    if (ignoreInit && !initialized) {
-      initialized <<- TRUE
-      req(FALSE)
-    }
+        req(!ignoreNULL || !isNullEvent(value))
 
-    req(!ignoreNULL || !isNullEvent(e))
-
-    isolate(handlerFunc())
+        isolate(handlerFunc())
+      }
+    )
   }, label = label, domain = domain, ..stacktraceon = FALSE))
 }
 

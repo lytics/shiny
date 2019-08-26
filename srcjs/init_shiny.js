@@ -101,7 +101,7 @@ function initShiny() {
 
   inputs = new InputValidateDecorator(inputs);
 
-  exports.onInputChange = function(name, value, opts) {
+  exports.setInputValue = exports.onInputChange = function(name, value, opts) {
     opts = addDefaultInputOpts(opts);
     inputs.setInput(name, value, opts);
   };
@@ -116,7 +116,11 @@ function initShiny() {
       if (type)
         id = id + ":" + type;
 
-      let opts = { immediate: !allowDeferred, binding: binding, el: el };
+      let opts = {
+        priority: allowDeferred ? "deferred" : "immediate",
+        binding: binding,
+        el: el
+      };
       inputs.setInput(id, value, opts);
     }
   }
@@ -277,7 +281,7 @@ function initShiny() {
 
   // The server needs to know the size of each image and plot output element,
   // in case it is auto-sizing
-  $('.shiny-image-output, .shiny-plot-output').each(function() {
+  $('.shiny-image-output, .shiny-plot-output, .shiny-report-size').each(function() {
     var id = getIdFromEl(this);
     if (this.offsetWidth !== 0 || this.offsetHeight !== 0) {
       initialValues['.clientdata_output_' + id + '_width'] = this.offsetWidth;
@@ -285,7 +289,7 @@ function initShiny() {
     }
   });
   function doSendImageSize() {
-    $('.shiny-image-output, .shiny-plot-output').each(function() {
+    $('.shiny-image-output, .shiny-plot-output, .shiny-report-size').each(function() {
       var id = getIdFromEl(this);
       if (this.offsetWidth !== 0 || this.offsetHeight !== 0) {
         inputs.setInput('.clientdata_output_' + id + '_width', this.offsetWidth);
@@ -409,17 +413,17 @@ function initShiny() {
   // Need to register callbacks for each Bootstrap 3 class.
   var bs3classes = ['modal', 'dropdown', 'tab', 'tooltip', 'popover', 'collapse'];
   $.each(bs3classes, function(idx, classname) {
-    $('body').on('shown.bs.' + classname + '.sendImageSize', '*',
+    $(document.body).on('shown.bs.' + classname + '.sendImageSize', '*',
       filterEventsByNamespace('bs', sendImageSize));
-    $('body').on('shown.bs.' + classname + '.sendOutputHiddenState ' +
+    $(document.body).on('shown.bs.' + classname + '.sendOutputHiddenState ' +
                  'hidden.bs.' + classname + '.sendOutputHiddenState',
                  '*', filterEventsByNamespace('bs', sendOutputHiddenState));
   });
 
   // This is needed for Bootstrap 2 compatibility and for non-Bootstrap
   // related shown/hidden events (like conditionalPanel)
-  $('body').on('shown.sendImageSize', '*', sendImageSize);
-  $('body').on('shown.sendOutputHiddenState hidden.sendOutputHiddenState', '*',
+  $(document.body).on('shown.sendImageSize', '*', sendImageSize);
+  $(document.body).on('shown.sendOutputHiddenState hidden.sendOutputHiddenState', '*',
                sendOutputHiddenState);
 
   // Send initial pixel ratio, and update it if it changes
